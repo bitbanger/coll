@@ -1,0 +1,6 @@
+requests==2.34.2
+psycopg2-binary==2.9.13
+boto3==1.43.126
+botocore[crt]==1.43.126
+rich==15.0.0
+tenacity==9.2.1
