@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+import re
+
 import boto3
 import functools
 import json
@@ -10,12 +12,23 @@ import requests
 from collections.abc import Callable
 from psycopg2.extras import RealDictCursor
 from rich import print
-from tenacity import retry, wait_exponential, stop_after_attempt
-from typing import Any, Concatenate, Dict, Iterable, ParamSpec, Self, TypeVar
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+from typing import cast, Any, Concatenate, Dict, Iterable, List, ParamSpec, Self, TypeVar
+from uuid import uuid4
+
+from cw import cw
 
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+F = TypeVar("F", bound=Callable[..., Any])
+def typed_retry(f: F) -> F:
+	return cast(F, retry(
+		stop=stop_after_attempt(3),
+		wait=wait_exponential(),
+		retry=retry_if_exception(lambda e: 'closed' in str(e).lower())
+	)(f))
 
 
 class RDS:
@@ -105,7 +118,7 @@ class RDS:
 		return wrapper
 
 
-	@retry(stop=stop_after_attempt(3), wait=wait_exponential())
+	@typed_retry
 	@_reconnect
 	def query(self: Self, q: str) -> Iterable[Dict[str, Any]]:
 		assert(self._connection is not None)
@@ -116,6 +129,51 @@ class RDS:
 				cur.execute(q)
 				while (row:=cur.fetchone()):
 					yield {k: v for k, v in row.items()}
+
+
+	@staticmethod
+	def uuid() -> str:
+		return str(uuid4())
+
+
+	@typed_retry
+	@_reconnect
+	def insert(
+		self: Self,
+		table: str,
+		rows: Iterable[Dict[str, Any]],
+	):
+		assert(self._connection is not None)
+
+		# Check valid table identifier
+		assert(any(re.match(pat, table) for pat in (
+			r"[a-zA-Z0-9_]+",
+			r"[a-zA-Z0-9_]+\.[a-zA-Z0-9_]",
+		)))
+
+		# Write the data CSV
+		with cw(fn:=f"/tmp/{RDS.uuid()}") as w:
+			for row in rows:
+				w.write(row)
+
+		# Craft the query
+		with open(fn, 'r') as f:
+			keys = f.readline().strip()
+		assert(re.match(r"[0-9A-Za-z_]*", k) for k in keys.split(','))
+		tmp_table_name = 'tab_' + RDS.uuid().replace('-', '')
+		sql = f"""
+			create temporary table {tmp_table_name} (like {table});
+			COPY {tmp_table_name} ({keys})
+			FROM STDIN 
+			WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',');
+			insert into {table} select * from {tmp_table_name} on conflict do nothing;
+		"""
+
+		# Execute
+		with self._connection:
+			with self._connection.cursor() as cur:
+				with open(fn, 'r') as f:
+					cur.copy_expert(sql, f)
 
 
 def main():

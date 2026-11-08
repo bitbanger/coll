@@ -4,3 +4,4 @@ boto3==1.43.126
 botocore[crt]==1.43.126
 rich==15.0.0
 tenacity==9.2.1
+curl_cffi==0.17.0
