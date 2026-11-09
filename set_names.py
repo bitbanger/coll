@@ -4,7 +4,7 @@ from collections.abc import Callable
 import json as _json
 import re
 import time
-from typing import Any, Dict, Iterable, List, TypeAlias, TypeVar, cast
+from typing import Any, Dict, Iterable, List, Optional, Self, TypeAlias, TypeVar, cast
 
 from curl_cffi import requests
 
@@ -69,109 +69,111 @@ def curl(
 	return resp.text if not json else _json.loads(resp.text)
 
 
-def sports() -> List[str]:
-	return sorted(set(re.findall(
-		r'/([a-z]*)-cards"',
-		str(curl('curls/scp_main.sh', json=False)),
-	)))
+class SCP:
+	def __init__(self: Self, db: Optional[RDS] = None) -> None:
+		self.db = db if db is not None else RDS()
 
 
-def sets(sport: str) -> JSON:
-	with open('curls/set_names.sh', 'r') as f:
-		return curl(f.read().format(sport=sport))
+	def fetch_categories(self: Self) -> List[str]:
+		return sorted(set(re.findall(
+			r'/([a-z]*)-cards"',
+			str(curl('curls/scp_main.sh', json=False)),
+		)))
 
 
-def populate_db_sport_sets(sport: str) -> None:
-	db = RDS()
-	sp_sets: List[Dict[str, str]] = sets(sport) # type: ignore
-	db.insert(
-		'scp.sets',
-		({
-			'pid': row['value'],
-			'sport': sport,
-			'name': row['label'],
-		} for row in sp_sets if row.get('value')),
-	)
-
-
-def populate_db_sets() -> None:
-	for sport in track(sports(), description='Downloading: '):
-		try:
-			populate_db_sport_sets(sport)
-		except Exception as e:
-			if '404' in str(e):
-				print(f"{sport} 404")
-				continue
-			else:
-				raise e
-		print(f"{sport} done")
-		time.sleep(2)
-	pass
-
-
-def populate_db_cards(gid: str) -> Iterable[Dict[str, Any]]:
-	db = RDS()
-	rec = list(db.query(f"select sport, name from scp.sets where gid='{gid}'"))[0]
-
-	url_name = rec['sport'] + '-cards-' + rec['name'].replace(' ', '-')
-
-	with open('curls/fetch.sh', 'r') as f:
-		curl_txt = f.read()
-	cursor = 0
-	while True:
-		try:
-			resp: Dict[str, Any] | None = curl(
-				curl_txt.format(name=url_name, cursor=cursor),
+	def fetch_set_list(self: Self, category: str) -> Iterable[Dict[str, Any]]:
+		with open('curls/set_names.sh', 'r') as f:
+			resp: List[Dict[str, str]] = curl(
+				f.read().format(category=category),
 				json=True,
 			) # type: ignore
-		except Exception as e:
-			if '404' in str(e):
-				if '-cards-' in url_name:
-					url_name = url_name.split('-cards-')[-1]
+			now = int(time.time())
+			for row in resp:
+				yield {
+					**row,
+					'etl_category': category,
+					'etl_time': now,
+				}
+
+
+	def fetch_cards(self: Self, set_id: str) -> Iterable[Dict[str, Any]]:
+		rec = list(self.db.query(f"select etl_category, label from scp_raw.sets where value='{set_id}'"))[0]
+
+		url_set_name = rec['etl_category'] + '-cards-' + rec['label'].replace(' ', '-')
+
+		with open('curls/fetch.sh', 'r') as f:
+			curl_txt = f.read()
+		cursor = 0
+		while True:
+			try:
+				resp: Dict[str, Any] | None = curl(
+					curl_txt.format(name=url_set_name, cursor=cursor),
+					json=True,
+				) # type: ignore
+			except Exception as e:
+				if '404' in str(e) and '-cards-' in url_set_name:
+					url_set_name = url_set_name.split('-cards-')[-1]
+					continue
+				raise e
+
+			if resp is None:
+				break
+
+			now = int(time.time())
+			for p in resp['products']:
+				yield {
+					**p,
+					'etl_set_id': set_id,
+					'etl_url_set_name': url_set_name,
+					'etl_time': now,
+				}
+
+			if 'cursor' not in resp:
+				break
+
+			cursor = int(resp['cursor'])
+
+
+	def db_populate_sets(self: Self) -> None:
+		for category in track(self.fetch_categories(), description='Downloading: '):
+			try:
+				self.db.insert('scp_raw.sets', self.fetch_set_list(category), create_table=True)
+			except Exception as e:
+				if '404' in str(e):
+					print(f"{category} 404")
 					continue
 				else:
 					raise e
-			else:
-				raise e
+			print(f"{category} done")
+			time.sleep(2)
+		pass
 
-		if resp is None:
-			break
 
-		now = int(time.time())
-		for p in resp['products']:
-			yield {
-				'gid': gid,
-				'console_uri': p['consoleUri'],
-				'has_product': p['hasProduct'],
-				'pid': p['id'],
-				'image_uri': p['imageUri'],
-				'is_card': p['isCard'],
-				'is_proof_coin': p['isProofCoin'],
-				'price1': p['price1'],
-				'price2': p['price2'],
-				'price3': p['price3'],
-				'price_change': p['priceChange'],
-				'price_change_percentage': p['priceChangePercentage'],
-				'price_change_sign': p['priceChangeSign'],
-				'print_run': p['printRun'],
-				'product_name': p['productName'],
-				'product_uri': p['productUri'],
-				'show_cover_art': p['showCoverArt'],
-				'wishlist_has_product': p['wishlistHasProduct'],
-				'scraped_at': now,
-			}
+	def db_populate_cards(self: Self, set_id: str) -> None:
+		self.db.insert('scp_raw.cards', self.fetch_cards(set_id), create_table=True)
 
-		if 'cursor' not in resp:
-			break
 
-		cursor = int(resp['cursor'])
+	def set_id(self: Self, category: str, name: str) -> str:
+		return list(self.db.query(f"select value from scp_raw.sets where lower(etl_category)='{category.lower()}' and lower(label)='{name.lower()}'"))[0]['value']
 
 
 def main():
+	scp = SCP()
+	scp.db_populate_cards(scp.set_id('magic', 'magic reality fracture'))
+	quit()
+	# scp.db_populate_sets()
+	# scp.db_populate_cards('G59903') # FIN
+	# scp.db_populate
+	'''
+	for row in scp.fetch_set_list('magic'):
+		print(row)
+	'''
+	'''
 	RDS().insert(
-		'scp.cards',
+		'scp_raw.cards',
 		populate_db_cards('G100007'),
 	)
+	'''
 
 
 if __name__ == '__main__':

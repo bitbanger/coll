@@ -142,6 +142,7 @@ class RDS:
 		self: Self,
 		table: str,
 		rows: Iterable[Dict[str, Any]],
+		create_table: bool = False,
 	):
 		assert(self._connection is not None)
 
@@ -156,10 +157,12 @@ class RDS:
 			for row in rows:
 				w.write(row)
 
-		# Craft the query
+		# Parse the keys
 		with open(fn, 'r') as f:
 			keys = f.readline().strip()
 		assert(re.match(r"[0-9A-Za-z_]*", k) for k in keys.split(','))
+
+		# Craft the query
 		tmp_table_name = 'tab_' + RDS.uuid().replace('-', '')
 		sql = f"""
 			create temporary table {tmp_table_name} (like {table});
@@ -168,6 +171,12 @@ class RDS:
 			WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',');
 			insert into {table} select * from {tmp_table_name} on conflict do nothing;
 		"""
+		if create_table:
+			typed_keys = ','.join(f"{k} text" for k in keys.split(','))
+			sql = f"create table if not exists {table} ({typed_keys});\n\n" + sql
+			if '.' in table:
+				schema = table.split('.')[0]
+				sql = f"create schema if not exists {schema};\n" + sql
 
 		# Execute
 		with self._connection:
